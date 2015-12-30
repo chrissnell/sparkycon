@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	blockSize        int64  = 10
+	blockSize        int64  = 50
 	reportIntervalMS uint64 = 100 // report interval in milliseconds
 	testLength       uint   = 15
 )
@@ -225,8 +225,7 @@ func (mc *MeteredClient) MeasureThroughput() {
 		case <-tick.C:
 			// Every second, we calculate how many blocks were received
 			// and derive an average throughput rate.
-			//			r := float64((blockCount - prevBlockCount) * uint64(blockSize) * (1000 / reportIntervalMS))
-			tr := (float64(blockCount - prevBlockCount)) * float64(blockSize) / float64(reportIntervalMS)
+			tr := (float64(blockCount - prevBlockCount)) * float64(blockSize*8) / float64(reportIntervalMS)
 			mc.throughputReport <- tr
 			prevBlockCount = blockCount
 		}
@@ -236,7 +235,6 @@ func (mc *MeteredClient) MeasureThroughput() {
 func (mc *MeteredClient) ReportThroughput(dir TestType) {
 	var readings []float64
 	var avgThroughput, maxThroughput float64
-
 	var readingCount, readingSum float64
 
 	for {
