@@ -128,7 +128,7 @@ func (mc *meteredClient) runTestSequence() {
 
 	// Build a download graph widget
 	dlGraph := termui.NewLineChart()
-	dlGraph.BorderLabel = " Download Throughput "
+	dlGraph.BorderLabel = " Download Speed (Mbit/s)"
 	dlGraph.Data = []float64{0}
 	dlGraph.Width = 30
 	dlGraph.Height = 12
@@ -145,7 +145,7 @@ func (mc *meteredClient) runTestSequence() {
 
 	// Build an upload graph widget
 	ulGraph := termui.NewLineChart()
-	ulGraph.BorderLabel = " Upload Throughput "
+	ulGraph.BorderLabel = " Upload Speed (Mbit/s)"
 	ulGraph.Data = []float64{0}
 	ulGraph.Width = 30
 	ulGraph.Height = 12
