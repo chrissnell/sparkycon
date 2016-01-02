@@ -61,6 +61,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	if termui.TermWidth() < 60 || termui.TermHeight() < 28 {
+		fmt.Println("sparkyfish needs a terminal window at least 60x28 to run.")
+		os.Exit(1)
+	}
+
 	defer termui.Close()
 
 	// 'q' quits the program
