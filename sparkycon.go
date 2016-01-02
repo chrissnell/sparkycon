@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -17,7 +18,7 @@ import (
 
 const (
 	blockSize        int64  = 50
-	reportIntervalMS uint64 = 200 // report interval in milliseconds
+	reportIntervalMS uint64 = 300 // report interval in milliseconds
 	testLength       uint   = 10
 )
 
@@ -39,11 +40,11 @@ type meteredClient struct {
 	statsGeneratorDone chan struct{}
 	dlReport           chan float64
 	ulReport           chan float64
-	rj                 *renderJobs
+	wr                 *widgetRenderer
 	rendererMu         *sync.Mutex
 }
 
-type renderJobs struct {
+type widgetRenderer struct {
 	jobs map[string]termui.Bufferer
 }
 
@@ -65,7 +66,7 @@ func main() {
 	})
 
 	mc := newMeteredClient()
-	mc.rj = newRenderJobs()
+	mc.wr = newwidgetRenderer()
 
 	// Begin our tests
 	go mc.runThroughputTestSequence()
@@ -85,19 +86,38 @@ func (mc *meteredClient) runThroughputTestSequence() {
 	titleBox.TextFgColor = termui.ColorWhite | termui.AttrBold
 
 	// Build a download graph widget
-	throughputGraph := termui.NewLineChart()
-	throughputGraph.BorderLabel = " Download Throughput "
-	throughputGraph.Width = 50
-	throughputGraph.Height = 12
-	throughputGraph.X = 0
-	throughputGraph.Y = 1
-	//throughputGraph.Mode = "dot"
-	//throughputGraph.DotStyle = '+'
-	throughputGraph.AxesColor = termui.ColorWhite
-	throughputGraph.LineColor = termui.ColorGreen | termui.AttrBold
+	dlGraph := termui.NewLineChart()
+	dlGraph.BorderLabel = " Download Throughput "
+	dlGraph.Width = 25
+	dlGraph.Height = 12
+	dlGraph.X = 0
+	dlGraph.Y = 1
+	// Windows Command Prompt doesn't support our Unicode characters with the default font
+	if runtime.GOOS == "windows" {
+		dlGraph.Mode = "dot"
+		dlGraph.DotStyle = '+'
+	}
+	dlGraph.AxesColor = termui.ColorWhite
+	dlGraph.LineColor = termui.ColorGreen | termui.AttrBold
+
+	// Build an upload graph widget
+	ulGraph := termui.NewLineChart()
+	ulGraph.BorderLabel = " Upload Throughput "
+	ulGraph.Data = []float64{0}
+	ulGraph.Width = 25
+	ulGraph.Height = 12
+	ulGraph.X = 25
+	ulGraph.Y = 1
+	// Windows Command Prompt doesn't support our Unicode characters with the default font
+	if runtime.GOOS == "windows" {
+		ulGraph.Mode = "dot"
+		ulGraph.DotStyle = '+'
+	}
+	ulGraph.AxesColor = termui.ColorWhite
+	ulGraph.LineColor = termui.ColorGreen | termui.AttrBold
 
 	// Build a stats summary widget
-	statsSummary := termui.NewPar("Borderless Text")
+	statsSummary := termui.NewPar("")
 	statsSummary.Height = 7
 	statsSummary.Width = 50
 	statsSummary.Y = 13
@@ -128,12 +148,13 @@ func (mc *meteredClient) runThroughputTestSequence() {
 	helpBox.Bg = termui.ColorBlue
 
 	// Add the widgets to the rendering jobs and render the screen
-	mc.rj.Add("titlebox", titleBox)
-	mc.rj.Add("throughputGraph", throughputGraph)
-	mc.rj.Add("statsSummary", statsSummary)
-	mc.rj.Add("progress", progress)
-	mc.rj.Add("helpbox", helpBox)
-	mc.rj.Render()
+	mc.wr.Add("titlebox", titleBox)
+	mc.wr.Add("dlgraph", dlGraph)
+	mc.wr.Add("ulgraph", ulGraph)
+	mc.wr.Add("statsSummary", statsSummary)
+	mc.wr.Add("progress", progress)
+	mc.wr.Add("helpbox", helpBox)
+	mc.wr.Render()
 
 	// Prepare some channels that we'll use to send throughput
 	// reports to the stats summary widget.
@@ -143,10 +164,13 @@ func (mc *meteredClient) runThroughputTestSequence() {
 	mc.ulDone = make(chan struct{})
 	mc.statsGeneratorDone = make(chan struct{})
 
+	// Start our stats generator, which receives realtime measurements from the throughput
+	// reporter and generates metrics from them
+	go mc.generateStats()
+
 	// Start our d/l throughput reporter to receive throughput measurements and send
 	// them on to be rendered in our stats widget
 	go mc.ReportThroughputDL()
-	go mc.generateStats()
 
 	// Run our download tests and block until that's done
 	mc.runThroughputTest(inbound)
@@ -154,31 +178,15 @@ func (mc *meteredClient) runThroughputTestSequence() {
 	// Signal to the throughput reporter that the download test is complete
 	close(mc.dlDone)
 
-	// To reset the Y-axis on our throughput graph, we have to delete
-	// the widget and then add the widget back before rendering again
-	mc.rj.Delete("throughputGraph")
-	throughputGraph = termui.NewLineChart()
-	throughputGraph.BorderLabel = " Upload Throughput "
-	throughputGraph.Width = 50
-	throughputGraph.Height = 12
-	throughputGraph.X = 0
-	throughputGraph.Y = 1
-	// throughputGraph.Mode = "dot"
-	// throughputGraph.DotStyle = '+'
-	throughputGraph.AxesColor = termui.ColorWhite
-	throughputGraph.LineColor = termui.ColorRed | termui.AttrBold
-	mc.rj.Add("throughputGraph", throughputGraph)
-	mc.rj.Render()
-
 	// Start our u/l throughput reporter to receive throughput measurements and send
 	// them on to be rendered in our stats widget
 	go mc.ReportThroughputUL()
 
+	// Run an outbound (upload) throughput test and block until it's complete
 	mc.runThroughputTest(outbound)
 
+	// Signal to our generators that the upload test is complete
 	close(mc.statsGeneratorDone)
-
-	// Signal to the throughput reporter that the upload test is complete
 	close(mc.ulDone)
 
 	return
@@ -189,6 +197,7 @@ func (mc *meteredClient) runThroughputTest(dir testType) {
 	// Used to signal test completion to the throughput measurer
 	measurerDone := make(chan struct{})
 
+	// Launch a progress bar updater
 	go mc.updateProgressBar()
 
 	// Launch a throughput measurer and then kick off the metered copy,
@@ -240,7 +249,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 			termui.Close()
 			log.Fatalln(err)
 		}
-		// Create a new randbo Reader
+		// Create a new randbo Reader, used to generate our random data that we'll upload
 		rnd = randbo.New()
 	}
 
@@ -249,6 +258,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 
 	switch dir {
 	case inbound:
+		// Receive, tally, and discard incoming data as fast as we can until the sender stops sending or the timer expires
 		for {
 			select {
 			case <-timer.C:
@@ -256,6 +266,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 				close(measurerDone)
 				return
 			default:
+				// Copy data from our net.Conn to the rubbish bin in (blockSize) KB chunks
 				_, err = io.CopyN(ioutil.Discard, conn, 1024*blockSize)
 				if err != nil {
 					if err == io.EOF {
@@ -265,12 +276,13 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 					log.Println("Error copying:", err)
 					return
 				}
-				// With each 100K copied, we send a message on our blockTicker channel
+				// With each chunk copied, we send a message on our blockTicker channel
 				mc.blockTicker <- true
 
 			}
 		}
 	case outbound:
+		// Send and tally outgoing data as fast as we can until the receiver stops receiving or the timer expires
 		for {
 			select {
 			case <-timer.C:
@@ -278,6 +290,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 				close(measurerDone)
 				return
 			default:
+				// Copy data from our RNG to the net.Conn in (blockSize) KB chunks
 				_, err = io.CopyN(conn, rnd, 1024*blockSize)
 				if err != nil {
 					if err == io.EOF {
@@ -287,13 +300,15 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 					log.Println("Error copying:", err)
 					return
 				}
-				// With each 100K copied, we send a message on our blockTicker channel
+				// With each chunk copied, we send a message on our blockTicker channel
 				mc.blockTicker <- true
 			}
 		}
 	}
 }
 
+// MeasureThroughput receives ticks sent by MeteredCopy() and derives a throughput rate, which is then sent
+// to the throughput reporter.
 func (mc *meteredClient) MeasureThroughput(measurerDone <-chan struct{}) {
 	var blockCount, prevBlockCount uint64
 
@@ -316,6 +331,9 @@ func (mc *meteredClient) MeasureThroughput(measurerDone <-chan struct{}) {
 	}
 }
 
+// ReportThroughputDL receives throughput reports for the download test
+// and updates the bar chart accordingly. It also passes them on to the
+// stats generator.
 func (mc *meteredClient) ReportThroughputDL() {
 	var dlReadings []float64
 
@@ -327,13 +345,16 @@ func (mc *meteredClient) ReportThroughputDL() {
 			}
 			dlReadings = append(dlReadings, r)
 			mc.dlReport <- r
-			mc.rj.jobs["throughputGraph"].(*termui.LineChart).Data = dlReadings
+			mc.wr.jobs["dlgraph"].(*termui.LineChart).Data = dlReadings
 		case <-mc.dlDone:
 			return
 		}
 	}
 }
 
+// ReportThroughputDL receives throughput reports for the upload test
+// and updates the bar chart accordingly. It also passes them on to the
+// stats generator.
 func (mc *meteredClient) ReportThroughputUL() {
 	var ulReadings []float64
 
@@ -345,13 +366,15 @@ func (mc *meteredClient) ReportThroughputUL() {
 			}
 			ulReadings = append(ulReadings, r)
 			mc.ulReport <- r
-			mc.rj.jobs["throughputGraph"].(*termui.LineChart).Data = ulReadings
+			mc.wr.jobs["ulgraph"].(*termui.LineChart).Data = ulReadings
 		case <-mc.ulDone:
 			return
 		}
 	}
 }
 
+// generateStats receives download and upload speed reports and computes metrics
+// which are displayed in the stats widget.
 func (mc *meteredClient) generateStats() {
 	var currentDL, maxDL, avgDL float64
 	var currentUL, maxUL, avgUL float64
@@ -368,10 +391,10 @@ func (mc *meteredClient) generateStats() {
 				maxDL = currentDL
 			}
 			// Update our stats widget with the latest readings
-			mc.rj.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
+			mc.wr.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
 				strconv.FormatFloat(currentDL, 'f', 1, 64), strconv.FormatFloat(maxDL, 'f', 1, 64), strconv.FormatFloat(avgDL, 'f', 1, 64),
 				strconv.FormatFloat(currentUL, 'f', 1, 64), strconv.FormatFloat(maxUL, 'f', 1, 64), strconv.FormatFloat(avgUL, 'f', 1, 64))
-			mc.rj.Render()
+			mc.wr.Render()
 		case currentUL = <-mc.ulReport:
 			ulReadingCount++
 			ulReadingSum = ulReadingSum + currentUL
@@ -380,21 +403,22 @@ func (mc *meteredClient) generateStats() {
 				maxUL = currentUL
 			}
 			// Update our stats widget with the latest readings
-			mc.rj.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
+			mc.wr.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
 				strconv.FormatFloat(currentDL, 'f', 1, 64), strconv.FormatFloat(maxDL, 'f', 1, 64), strconv.FormatFloat(avgDL, 'f', 1, 64),
 				strconv.FormatFloat(currentUL, 'f', 1, 64), strconv.FormatFloat(maxUL, 'f', 1, 64), strconv.FormatFloat(avgUL, 'f', 1, 64))
-			mc.rj.Render()
+			mc.wr.Render()
 		case <-mc.statsGeneratorDone:
 			return
 		}
 	}
 }
 
+// updateProgressBar updates the progress bar as tests run
 func (mc *meteredClient) updateProgressBar() {
 	var updateIntervalMS uint = 500
 	var progress uint
 
-	mc.rj.jobs["progress"].(*termui.Gauge).BarColor = termui.ColorRed
+	mc.wr.jobs["progress"].(*termui.Gauge).BarColor = termui.ColorRed
 
 	//progressPerUpdate := testLength / (updateIntervalMS / 1000)
 	var progressPerUpdate uint = 100 / 20
@@ -409,35 +433,35 @@ func (mc *meteredClient) updateProgressBar() {
 		select {
 		case <-tick.C:
 			progress = progress + progressPerUpdate
-			mc.rj.jobs["progress"].(*termui.Gauge).Percent = int(progress)
-			mc.rj.Render()
+			mc.wr.jobs["progress"].(*termui.Gauge).Percent = int(progress)
+			mc.wr.Render()
 		case <-timer.C:
-			mc.rj.jobs["progress"].(*termui.Gauge).Percent = 100
-			mc.rj.jobs["progress"].(*termui.Gauge).BarColor = termui.ColorGreen
-			mc.rj.Render()
+			mc.wr.jobs["progress"].(*termui.Gauge).Percent = 100
+			mc.wr.jobs["progress"].(*termui.Gauge).BarColor = termui.ColorGreen
+			mc.wr.Render()
 			return
 		}
 	}
 
 }
 
-func newRenderJobs() *renderJobs {
-	rj := renderJobs{}
-	rj.jobs = make(map[string]termui.Bufferer)
-	return &rj
+func newwidgetRenderer() *widgetRenderer {
+	wr := widgetRenderer{}
+	wr.jobs = make(map[string]termui.Bufferer)
+	return &wr
 }
 
-func (rj *renderJobs) Add(name string, job termui.Bufferer) {
-	rj.jobs[name] = job
+func (wr *widgetRenderer) Add(name string, job termui.Bufferer) {
+	wr.jobs[name] = job
 }
 
-func (rj *renderJobs) Delete(name string) {
-	delete(rj.jobs, name)
+func (wr *widgetRenderer) Delete(name string) {
+	delete(wr.jobs, name)
 }
 
-func (rj *renderJobs) Render() {
+func (wr *widgetRenderer) Render() {
 	var jobs []termui.Bufferer
-	for _, j := range rj.jobs {
+	for _, j := range wr.jobs {
 		jobs = append(jobs, j)
 	}
 	termui.Render(jobs...)
