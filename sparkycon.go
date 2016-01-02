@@ -41,10 +41,6 @@ type meteredClient struct {
 	rendererMu         *sync.Mutex
 }
 
-type widgetRenderer struct {
-	jobs map[string]termui.Bufferer
-}
-
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: ", os.Args[0], " <sparkyfish IP:port>")
@@ -222,6 +218,9 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 		// For inbound tests, we bump our timer by 2 seconds to account for
 		// the remote server's test startup time
 		tl = time.Second * time.Duration(testLength+2)
+
+		// Send the SND command to the remote server, requesting a download test
+		// (remote sends).
 		_, err = conn.Write([]byte("SND"))
 		if err != nil {
 			termui.Close()
@@ -229,6 +228,9 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 		}
 	case outbound:
 		tl = time.Second * time.Duration(testLength)
+
+		// Send the RCV command to the remote server, requesting an upload test
+		// (remote receives).
 		_, err = conn.Write([]byte("RCV"))
 		if err != nil {
 			termui.Close()
@@ -254,6 +256,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 				// Copy data from our net.Conn to the rubbish bin in (blockSize) KB chunks
 				_, err = io.CopyN(ioutil.Discard, conn, 1024*blockSize)
 				if err != nil {
+					// Handle the EOF when the test timer has expired at the remote end.
 					if err == io.EOF {
 						close(measurerDone)
 						return
@@ -295,7 +298,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 // MeasureThroughput receives ticks sent by MeteredCopy() and derives a throughput rate, which is then sent
 // to the throughput reporter.
 func (mc *meteredClient) MeasureThroughput(measurerDone <-chan struct{}) {
-	var dir testType = inbound
+	var dir = inbound
 	var blockCount, prevBlockCount uint64
 	var throughput float64
 	var throughputHist []float64
@@ -310,22 +313,33 @@ func (mc *meteredClient) MeasureThroughput(measurerDone <-chan struct{}) {
 			tick.Stop()
 			return
 		case <-mc.changeToUpload:
+			// The download test has completed, so we switch to tallying upload chunks
 			dir = outbound
 		case <-tick.C:
-
 			throughput = (float64(blockCount - prevBlockCount)) * float64(blockSize*8) / float64(reportIntervalMS)
+
+			// We discard the first element of the throughputHist slice once we have 70
+			// elements stored.  This gives the user a chart that appears to scroll to
+			// the left as new measurements come in and old ones are discarded.
 			if len(throughputHist) >= 70 {
 				throughputHist = throughputHist[1:]
 			}
+
+			// Add our latest measurement to the slice of historical measurements
 			throughputHist = append(throughputHist, throughput)
+
+			// Update the appropriate graph with the latest measurements
 			switch dir {
 			case inbound:
 				mc.wr.jobs["dlgraph"].(*termui.LineChart).Data = throughputHist
 			case outbound:
 				mc.wr.jobs["ulgraph"].(*termui.LineChart).Data = throughputHist
 			}
+
+			// Send the latest measurement on to the stats generator
 			mc.throughputReport <- throughput
 
+			// Update the current block counter
 			prevBlockCount = blockCount
 		}
 	}
@@ -339,7 +353,7 @@ func (mc *meteredClient) generateStats() {
 	var currentUL, maxUL, avgUL float64
 	var dlReadingCount, dlReadingSum float64
 	var ulReadingCount, ulReadingSum float64
-	var dir testType = inbound
+	var dir = inbound
 
 	for {
 		select {
@@ -394,7 +408,8 @@ func (mc *meteredClient) updateProgressBar() {
 	// Set a ticker for updating the progress BarColor
 	tick := time.NewTicker(time.Duration(updateIntervalMS) * time.Millisecond)
 
-	// Set a timer to
+	// Set a timer to advance the progress bar.  Since we test on a fixed
+	// duration and not a fixed download size, we measure progress by time.
 	timer := time.NewTimer(time.Second * time.Duration(testLength))
 
 	for {
@@ -404,6 +419,7 @@ func (mc *meteredClient) updateProgressBar() {
 			mc.wr.jobs["progress"].(*termui.Gauge).Percent = int(progress)
 			mc.wr.Render()
 		case <-timer.C:
+			// Make sure that our progress bar always ends at 100%.  :)
 			mc.wr.jobs["progress"].(*termui.Gauge).Percent = 100
 			mc.wr.jobs["progress"].(*termui.Gauge).BarColor = termui.ColorGreen
 			mc.wr.Render()
@@ -411,26 +427,4 @@ func (mc *meteredClient) updateProgressBar() {
 		}
 	}
 
-}
-
-func newwidgetRenderer() *widgetRenderer {
-	wr := widgetRenderer{}
-	wr.jobs = make(map[string]termui.Bufferer)
-	return &wr
-}
-
-func (wr *widgetRenderer) Add(name string, job termui.Bufferer) {
-	wr.jobs[name] = job
-}
-
-func (wr *widgetRenderer) Delete(name string) {
-	delete(wr.jobs, name)
-}
-
-func (wr *widgetRenderer) Render() {
-	var jobs []termui.Bufferer
-	for _, j := range wr.jobs {
-		jobs = append(jobs, j)
-	}
-	termui.Render(jobs...)
 }
