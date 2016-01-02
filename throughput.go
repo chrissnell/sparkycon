@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/dustin/randbo"
@@ -14,24 +16,19 @@ import (
 
 // Kick off a throughput measurement test
 func (mc *meteredClient) runThroughputTest(dir testType) {
+	// Notify the progress bar updater to reset the bar
+	mc.progressBarReset <- true
+
 	// Used to signal test completion to the throughput measurer
 	measurerDone := make(chan struct{})
-
-	// Launch a progress bar updater
-	go mc.updateProgressBar()
 
 	// Launch a throughput measurer and then kick off the metered copy,
 	// blocking until it completes.
 	go mc.MeasureThroughput(measurerDone)
 	mc.MeteredCopy(dir, measurerDone)
-}
 
-// NewMeteredClient creates a new MeteredClient object
-func newMeteredClient() *meteredClient {
-	m := meteredClient{}
-	m.blockTicker = make(chan bool)
-	m.throughputReport = make(chan float64)
-	return &m
+	// Notify the progress bar updater that the test is done
+	mc.testDone <- true
 }
 
 // Kicks off a metered copy (throughput test) by sending a command to the server
@@ -56,7 +53,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 	case inbound:
 		// For inbound tests, we bump our timer by 2 seconds to account for
 		// the remote server's test startup time
-		tl = time.Second * time.Duration(testLength+2)
+		tl = time.Second * time.Duration(throughputTestLength+2)
 
 		// Send the SND command to the remote server, requesting a download test
 		// (remote sends).
@@ -66,7 +63,7 @@ func (mc *meteredClient) MeteredCopy(dir testType, measurerDone chan<- struct{})
 			log.Fatalln(err)
 		}
 	case outbound:
-		tl = time.Second * time.Duration(testLength)
+		tl = time.Second * time.Duration(throughputTestLength)
 
 		// Send the RCV command to the remote server, requesting an upload test
 		// (remote receives).
@@ -180,6 +177,56 @@ func (mc *meteredClient) MeasureThroughput(measurerDone <-chan struct{}) {
 
 			// Update the current block counter
 			prevBlockCount = blockCount
+		}
+	}
+}
+
+// generateStats receives download and upload speed reports and computes metrics
+// which are displayed in the stats widget.
+func (mc *meteredClient) generateStats() {
+	var measurement float64
+	var currentDL, maxDL, avgDL float64
+	var currentUL, maxUL, avgUL float64
+	var dlReadingCount, dlReadingSum float64
+	var ulReadingCount, ulReadingSum float64
+	var dir = inbound
+
+	for {
+		select {
+		case measurement = <-mc.throughputReport:
+			switch dir {
+			case inbound:
+				currentDL = measurement
+				dlReadingCount++
+				dlReadingSum = dlReadingSum + currentDL
+				avgDL = dlReadingSum / dlReadingCount
+				if currentDL > maxDL {
+					maxDL = currentDL
+				}
+				// Update our stats widget with the latest readings
+				mc.wr.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
+					strconv.FormatFloat(currentDL, 'f', 1, 64), strconv.FormatFloat(maxDL, 'f', 1, 64), strconv.FormatFloat(avgDL, 'f', 1, 64),
+					strconv.FormatFloat(currentUL, 'f', 1, 64), strconv.FormatFloat(maxUL, 'f', 1, 64), strconv.FormatFloat(avgUL, 'f', 1, 64))
+				mc.wr.Render()
+			case outbound:
+				currentUL = measurement
+				ulReadingCount++
+				ulReadingSum = ulReadingSum + currentUL
+				avgUL = ulReadingSum / ulReadingCount
+				if currentUL > maxUL {
+					maxUL = currentUL
+				}
+				// Update our stats widget with the latest readings
+				mc.wr.jobs["statsSummary"].(*termui.Par).Text = fmt.Sprintf("DOWNLOAD \nCurrent: %v Mbps\tMax: %v\tAvg: %v\n\nUPLOAD\nCurrent: %v Mbps\tMax: %v\tAvg: %v",
+					strconv.FormatFloat(currentDL, 'f', 1, 64), strconv.FormatFloat(maxDL, 'f', 1, 64), strconv.FormatFloat(avgDL, 'f', 1, 64),
+					strconv.FormatFloat(currentUL, 'f', 1, 64), strconv.FormatFloat(maxUL, 'f', 1, 64), strconv.FormatFloat(avgUL, 'f', 1, 64))
+				mc.wr.Render()
+
+			}
+		case <-mc.changeToUpload:
+			dir = outbound
+		case <-mc.statsGeneratorDone:
+			return
 		}
 	}
 }
