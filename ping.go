@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/gizak/termui"
@@ -59,7 +60,7 @@ func (mc *meteredClient) pingTest() {
 // pingProcessor recieves the ping times from pingTest and updates the UI
 func (mc *meteredClient) pingProcessor() {
 	var pingCount int
-	var ptSum, ptMax, ptMin int64
+	var ptMax, ptMin int
 	var latencyHist pingHistory
 
 	// We never want to run the ping test beyond maxPingTestLength seconds
@@ -79,17 +80,10 @@ func (mc *meteredClient) pingProcessor() {
 			// Calculate our ping time in microseconds
 			ptMicro := pt.Nanoseconds() / 1000
 
-			// Update our max/min ping times if applicable
-			ptSum = ptSum + ptMicro
-			if ptMax < ptMicro {
-				ptMax = ptMicro
-			}
-			if ptMin < ptMicro {
-				ptMin = ptMicro
-			}
-
 			// Add this ping to our ping history
 			latencyHist = append(latencyHist, ptMicro)
+
+			ptMin, ptMax = latencyHist.minMax()
 
 			// Advance the progress bar a bit
 			mc.pingProgressTicker <- true
@@ -139,4 +133,13 @@ func (h *pingHistory) variance() float64 {
 // stdDev calculates the standard deviation of our historical ping times
 func (h *pingHistory) stdDev() float64 {
 	return math.Sqrt(h.variance())
+}
+
+func (h *pingHistory) minMax() (int, int) {
+	var hist []int
+	for _, v := range *h {
+		hist = append(hist, int(v))
+	}
+	sort.Ints(hist)
+	return hist[0], hist[len(hist)-1]
 }
